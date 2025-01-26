@@ -4,13 +4,13 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/dukky/toydb/hashkv"
+	logdb "github.com/dukky/toydb/log"
 )
 
 func main() {
-	db := hashkv.NewHashKV("test.bin")
+	db := logdb.NewLog("test.bin")
 
-	err := db.Write("Goodbye", "world")
+	err := db.Write("Hello", "you")
 	if err != nil {
 		log.Fatal(err)
 	}
