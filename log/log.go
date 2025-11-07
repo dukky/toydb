@@ -2,8 +2,10 @@ package logdb
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"strings"
@@ -89,11 +91,14 @@ func compact(l *Log) error {
 	}
 	fmt.Println(seen)
 	for k := range seen {
-		data, err := json.Marshal(k)
+		var data bytes.Buffer
+		encoder := json.NewEncoder(&data)
+		encoder.SetEscapeHTML(false)
+		err := encoder.Encode(k)
 		if err != nil {
 			return fmt.Errorf("error marshalling line: %v", err)
 		}
-		_, err = file.Write(data)
+		_, err = io.Copy(file, &data)
 		if err != nil {
 			return fmt.Errorf("error writing data: %v", err)
 		}
