@@ -2,10 +2,8 @@ package logdb
 
 import (
 	"bufio"
-	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"strings"
@@ -79,26 +77,42 @@ func compact(l *Log) error {
 	if err != nil {
 		return fmt.Errorf("error opening file: %v", err)
 	}
+	defer file.Close()
+
 	scanner := bufio.NewScanner(file)
-	seen := make(map[string]struct{})
+	latestValues := make(map[string]string)
+
 	for scanner.Scan() {
-		seen[scanner.Text()] = struct{}{}
+		line := scanner.Bytes()
+		var entry map[string]string
+		if err := json.Unmarshal(line, &entry); err != nil {
+			// Ignore malformed lines
+			continue
+		}
+		for k, v := range entry {
+			latestValues[k] = v
+		}
 	}
-	file.Close()
+
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("error scanning file: %v", err)
+	}
+
+	// Re-create the file, truncating it
 	file, err = os.Create(l.LogPath)
 	if err != nil {
-		return err
+		return fmt.Errorf("error creating file: %v", err)
 	}
-	fmt.Println(seen)
-	for k := range seen {
-		var data bytes.Buffer
-		encoder := json.NewEncoder(&data)
-		encoder.SetEscapeHTML(false)
-		err := encoder.Encode(k)
+	defer file.Close()
+
+	for key, value := range latestValues {
+		marshalled, err := json.Marshal(map[string]string{
+			key: value,
+		})
 		if err != nil {
-			return fmt.Errorf("error marshalling line: %v", err)
+			return fmt.Errorf("error marshalling json: %v", err)
 		}
-		_, err = io.Copy(file, &data)
+		_, err = file.Write(marshalled)
 		if err != nil {
 			return fmt.Errorf("error writing data: %v", err)
 		}
@@ -107,5 +121,6 @@ func compact(l *Log) error {
 			return fmt.Errorf("error writing newline: %v", err)
 		}
 	}
+
 	return nil
 }
