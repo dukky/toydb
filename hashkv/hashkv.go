@@ -121,7 +121,6 @@ func NewHashKV(logPath string) *HashKV {
 		}
 		hashKV.byteOffsetIndex[keys[0]] = pos
 	}
-	fmt.Printf("%#v\n", hashKV.byteOffsetIndex)
 
 	return hashKV
 }
