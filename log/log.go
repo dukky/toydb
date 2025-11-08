@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
-	"log"
 	"os"
 	"strings"
 )
@@ -52,7 +51,7 @@ func (l *Log) Read(key string) (string, error) {
 	return latest, nil
 }
 
-func NewLog(logPath string) *Log {
+func NewLog(logPath string) (*Log, error) {
 	db := &Log{
 		LogPath: logPath,
 	}
@@ -60,28 +59,30 @@ func NewLog(logPath string) *Log {
 	if os.IsNotExist(err) {
 		file, err := os.Create(logPath)
 		if err != nil {
-			log.Fatal(err)
+			return nil, fmt.Errorf("error creating log file: %w", err)
 		}
-		defer file.Close()
-
-		return db
+		file.Close() // Close immediately as we don't need the handle here
+		return db, nil
 	}
+	// If file exists, attempt to compact it
 	if err = compact(db); err != nil {
-		log.Fatal(err)
+		return nil, fmt.Errorf("error during log compaction: %w", err)
 	}
-	return db
+	return db, nil
 }
 
 func compact(l *Log) error {
-	file, err := os.Open(l.LogPath)
+	// Open the original log file for reading
+	readFile, err := os.Open(l.LogPath)
 	if err != nil {
-		return fmt.Errorf("error opening file: %v", err)
+		return fmt.Errorf("error opening file for reading: %v", err)
 	}
-	defer file.Close()
+	defer readFile.Close()
 
-	scanner := bufio.NewScanner(file)
+	scanner := bufio.NewScanner(readFile)
 	latestValues := make(map[string]string)
 
+	// Read all entries and keep the latest value for each key
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		var entry map[string]string
@@ -98,13 +99,23 @@ func compact(l *Log) error {
 		return fmt.Errorf("error scanning file: %v", err)
 	}
 
-	// Re-create the file, truncating it
-	file, err = os.Create(l.LogPath)
+	// Create a temporary file for writing compacted data
+	// Use a pattern that ensures a unique filename and is in the same directory
+	// to ensure atomic rename across different filesystems is possible.
+	tmpFile, err := os.CreateTemp(l.LogPath[:strings.LastIndex(l.LogPath, "/")+1], "compact-*.log")
 	if err != nil {
-		return fmt.Errorf("error creating file: %v", err)
+		return fmt.Errorf("error creating temporary file: %v", err)
 	}
-	defer file.Close()
+	tmpPath := tmpFile.Name()
+	defer func() {
+		// Clean up the temporary file if an error occurs before rename
+		if err != nil {
+			os.Remove(tmpPath)
+		}
+	}()
+	defer tmpFile.Close()
 
+	// Write the compacted data to the temporary file
 	for key, value := range latestValues {
 		marshalled, err := json.Marshal(map[string]string{
 			key: value,
@@ -112,14 +123,19 @@ func compact(l *Log) error {
 		if err != nil {
 			return fmt.Errorf("error marshalling json: %v", err)
 		}
-		_, err = file.Write(marshalled)
+		_, err = tmpFile.Write(marshalled)
 		if err != nil {
-			return fmt.Errorf("error writing data: %v", err)
+			return fmt.Errorf("error writing data to temp file: %v", err)
 		}
-		_, err = file.Write([]byte("\n"))
+		_, err = tmpFile.Write([]byte("\n"))
 		if err != nil {
-			return fmt.Errorf("error writing newline: %v", err)
+			return fmt.Errorf("error writing newline to temp file: %v", err)
 		}
+	}
+
+	// Atomically replace the original log file with the temporary file
+	if err := os.Rename(tmpPath, l.LogPath); err != nil {
+		return fmt.Errorf("error renaming temporary file to %s: %v", l.LogPath, err)
 	}
 
 	return nil
