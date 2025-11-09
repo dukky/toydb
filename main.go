@@ -13,7 +13,7 @@ import (
 func main() {
 	dbFile := flag.String("file", "test.bin", "The path to the database file.")
 	dbType := flag.String("type", "log", "The type of database to use (log or hash).")
-	op := flag.String("op", "write", "The operation to perform (read or write).")
+	op := flag.String("op", "write", "The operation to perform (read, write, or delete).")
 	key := flag.String("key", "", "The key for the operation.")
 	value := flag.String("value", "", "The value for the write operation.")
 
@@ -53,6 +53,15 @@ func main() {
 			log.Fatalf("Error reading from database: %v", err)
 		}
 		fmt.Printf("Read value: %s\n", val)
+	case "delete":
+		if *key == "" {
+			log.Fatal("Key must be specified for a delete operation.")
+		}
+		err := d.Delete(*key)
+		if err != nil {
+			log.Fatalf("Error deleting from database: %v", err)
+		}
+		fmt.Println("Delete successful.")
 	default:
 		log.Fatalf("Unknown operation: %s", *op)
 	}

@@ -134,13 +134,20 @@ malformed_line
 
 			actualEntries := make(map[string]string)
 			for _, line := range lines {
-				var entry map[string]string
-				if err := json.Unmarshal([]byte(line), &entry); err != nil {
-					t.Errorf("Failed to unmarshal line '%s' from compacted file: %v", line, err)
-					continue
-				}
-				for k, v := range entry {
-					actualEntries[k] = v
+				// Try new format first
+				var newEntry LogEntry
+				if err := json.Unmarshal([]byte(line), &newEntry); err == nil && newEntry.Key != "" {
+					actualEntries[newEntry.Key] = newEntry.Value
+				} else {
+					// Fall back to old format
+					var entry map[string]string
+					if err := json.Unmarshal([]byte(line), &entry); err != nil {
+						t.Errorf("Failed to unmarshal line '%s' from compacted file: %v", line, err)
+						continue
+					}
+					for k, v := range entry {
+						actualEntries[k] = v
+					}
 				}
 			}
 
@@ -212,15 +219,257 @@ func TestNewLog(t *testing.T) {
 	}
 
 	for _, line := range lines {
-		var entry map[string]string
-		if err := json.Unmarshal([]byte(line), &entry); err != nil {
-			t.Errorf("Failed to unmarshal line '%s' from compacted file after NewLog: %v", line, err)
-			continue
-		}
-		for k, v := range entry {
-			if expectedV, ok := expectedEntries[k]; !ok || v != expectedV {
-				t.Errorf("Unexpected entry in compacted file after NewLog: %s:%s. Expected %s:%s", k, v, k, expectedV)
+		// Try new format first
+		var newEntry LogEntry
+		if err := json.Unmarshal([]byte(line), &newEntry); err == nil && newEntry.Key != "" {
+			if expectedV, ok := expectedEntries[newEntry.Key]; !ok || newEntry.Value != expectedV {
+				t.Errorf("Unexpected entry in compacted file after NewLog: %s:%s. Expected %s:%s", newEntry.Key, newEntry.Value, newEntry.Key, expectedV)
+			}
+		} else {
+			// Fall back to old format
+			var entry map[string]string
+			if err := json.Unmarshal([]byte(line), &entry); err != nil {
+				t.Errorf("Failed to unmarshal line '%s' from compacted file after NewLog: %v", line, err)
+				continue
+			}
+			for k, v := range entry {
+				if expectedV, ok := expectedEntries[k]; !ok || v != expectedV {
+					t.Errorf("Unexpected entry in compacted file after NewLog: %s:%s. Expected %s:%s", k, v, k, expectedV)
+				}
 			}
 		}
+	}
+}
+
+// Test delete operations
+func TestDelete(t *testing.T) {
+	tmpDir := t.TempDir()
+	logPath := filepath.Join(tmpDir, "test.log")
+
+	// Create a new log
+	logDB, err := NewLog(logPath)
+	if err != nil {
+		t.Fatalf("Failed to create new log: %v", err)
+	}
+
+	// Write a key-value pair
+	if err := logDB.Write("key1", "value1"); err != nil {
+		t.Fatalf("Failed to write key1: %v", err)
+	}
+
+	// Verify we can read it
+	value, err := logDB.Read("key1")
+	if err != nil {
+		t.Fatalf("Failed to read key1: %v", err)
+	}
+	if value != "value1" {
+		t.Errorf("Expected value1, got %s", value)
+	}
+
+	// Delete the key
+	if err := logDB.Delete("key1"); err != nil {
+		t.Fatalf("Failed to delete key1: %v", err)
+	}
+
+	// Try to read the deleted key - should return error
+	_, err = logDB.Read("key1")
+	if err == nil {
+		t.Error("Expected error when reading deleted key, got nil")
+	}
+	if !strings.Contains(err.Error(), "deleted") {
+		t.Errorf("Expected error message to contain 'deleted', got: %v", err)
+	}
+}
+
+// Test compaction removes tombstones
+func TestCompactRemovesTombstones(t *testing.T) {
+	tmpDir := t.TempDir()
+	logPath := filepath.Join(tmpDir, "test.log")
+
+	// Create a log with some data and deletions
+	initialContent := `{"key":"key1","value":"value1","deleted":false}
+{"key":"key2","value":"value2","deleted":false}
+{"key":"key1","value":"","deleted":true}
+{"key":"key3","value":"value3","deleted":false}`
+
+	if err := os.WriteFile(logPath, []byte(initialContent), 0644); err != nil {
+		t.Fatalf("Failed to write test file: %v", err)
+	}
+
+	// Compact the log
+	logDB := &Log{LogPath: logPath}
+	if err := compact(logDB); err != nil {
+		t.Fatalf("Failed to compact: %v", err)
+	}
+
+	// Read and verify compacted content
+	content, err := readFileContent(t, logPath)
+	if err != nil {
+		t.Fatalf("Failed to read compacted file: %v", err)
+	}
+
+	// Parse entries
+	lines := strings.Split(content, "\n")
+	if len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+
+	actualEntries := make(map[string]LogEntry)
+	for _, line := range lines {
+		var entry LogEntry
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatalf("Failed to unmarshal line: %v", err)
+		}
+		actualEntries[entry.Key] = entry
+	}
+
+	// key1 should be gone (was deleted)
+	if _, exists := actualEntries["key1"]; exists {
+		t.Error("key1 should have been removed during compaction")
+	}
+
+	// key2 and key3 should still exist
+	if entry, exists := actualEntries["key2"]; !exists || entry.Value != "value2" {
+		t.Errorf("key2 should exist with value2, got: %v", entry)
+	}
+	if entry, exists := actualEntries["key3"]; !exists || entry.Value != "value3" {
+		t.Errorf("key3 should exist with value3, got: %v", entry)
+	}
+}
+
+// Test backward compatibility with old format
+func TestBackwardCompatibility(t *testing.T) {
+	tmpDir := t.TempDir()
+	logPath := filepath.Join(tmpDir, "test.log")
+
+	// Create a log file with old format entries
+	oldFormatContent := `{"key1":"value1"}
+{"key2":"value2"}
+{"key3":"value3"}
+`
+
+	if err := os.WriteFile(logPath, []byte(oldFormatContent), 0644); err != nil {
+		t.Fatalf("Failed to write test file: %v", err)
+	}
+
+	logDB := &Log{LogPath: logPath}
+
+	// Should be able to read old format
+	value, err := logDB.Read("key1")
+	if err != nil {
+		t.Fatalf("Failed to read key1 from old format: %v", err)
+	}
+	if value != "value1" {
+		t.Errorf("Expected value1, got %s", value)
+	}
+
+	// Write a new entry (new format)
+	if err := logDB.Write("key4", "value4"); err != nil {
+		t.Fatalf("Failed to write key4: %v", err)
+	}
+
+	// Should be able to read both old and new format
+	value, err = logDB.Read("key4")
+	if err != nil {
+		t.Fatalf("Failed to read key4: %v", err)
+	}
+	if value != "value4" {
+		t.Errorf("Expected value4, got %s", value)
+	}
+
+	// Compact should convert old format to new format
+	if err := compact(logDB); err != nil {
+		t.Fatalf("Failed to compact: %v", err)
+	}
+
+	// All keys should still be readable
+	expectedValues := map[string]string{
+		"key1": "value1",
+		"key2": "value2",
+		"key3": "value3",
+		"key4": "value4",
+	}
+
+	for key, expectedValue := range expectedValues {
+		value, err := logDB.Read(key)
+		if err != nil {
+			t.Errorf("Failed to read %s after compaction: %v", key, err)
+		}
+		if value != expectedValue {
+			t.Errorf("Expected %s for key %s, got %s", expectedValue, key, value)
+		}
+	}
+}
+
+// Test Read returns error for non-existent key
+func TestReadNonExistentKey(t *testing.T) {
+	tmpDir := t.TempDir()
+	logPath := filepath.Join(tmpDir, "test.log")
+
+	logDB, err := NewLog(logPath)
+	if err != nil {
+		t.Fatalf("Failed to create new log: %v", err)
+	}
+
+	// Write some data
+	if err := logDB.Write("key1", "value1"); err != nil {
+		t.Fatalf("Failed to write key1: %v", err)
+	}
+
+	// Try to read a non-existent key
+	_, err = logDB.Read("nonexistent")
+	if err == nil {
+		t.Error("Expected error when reading non-existent key, got nil")
+	}
+	if !strings.Contains(err.Error(), "not found") {
+		t.Errorf("Expected error message to contain 'not found', got: %v", err)
+	}
+}
+
+// Test delete and re-write
+func TestDeleteAndRewrite(t *testing.T) {
+	tmpDir := t.TempDir()
+	logPath := filepath.Join(tmpDir, "test.log")
+
+	logDB, err := NewLog(logPath)
+	if err != nil {
+		t.Fatalf("Failed to create new log: %v", err)
+	}
+
+	// Write a key
+	if err := logDB.Write("key1", "value1"); err != nil {
+		t.Fatalf("Failed to write key1: %v", err)
+	}
+
+	// Delete the key
+	if err := logDB.Delete("key1"); err != nil {
+		t.Fatalf("Failed to delete key1: %v", err)
+	}
+
+	// Write the same key again with a new value
+	if err := logDB.Write("key1", "value2"); err != nil {
+		t.Fatalf("Failed to write key1 again: %v", err)
+	}
+
+	// Should be able to read the new value
+	value, err := logDB.Read("key1")
+	if err != nil {
+		t.Fatalf("Failed to read key1 after rewrite: %v", err)
+	}
+	if value != "value2" {
+		t.Errorf("Expected value2, got %s", value)
+	}
+
+	// After compaction, should still have the latest value
+	if err := compact(logDB); err != nil {
+		t.Fatalf("Failed to compact: %v", err)
+	}
+
+	value, err = logDB.Read("key1")
+	if err != nil {
+		t.Fatalf("Failed to read key1 after compaction: %v", err)
+	}
+	if value != "value2" {
+		t.Errorf("Expected value2 after compaction, got %s", value)
 	}
 }

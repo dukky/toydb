@@ -65,6 +65,12 @@ func (h *HashKV) Read(key string) (string, error) {
 	return string(data), nil
 }
 
+// Delete is not yet implemented for HashKV
+// TODO: Implement delete operations with tombstones for hashkv package
+func (h *HashKV) Delete(key string) error {
+	panic("Delete not yet implemented for HashKV")
+}
+
 func NewHashKV(logPath string) *HashKV {
 	hashKV := &HashKV{
 		logPath:         logPath,

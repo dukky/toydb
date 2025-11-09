@@ -12,14 +12,26 @@ type Log struct {
 	LogPath string
 }
 
+// LogEntry represents a single entry in the log file
+type LogEntry struct {
+	Key     string `json:"key"`
+	Value   string `json:"value"`
+	Deleted bool   `json:"deleted"`
+}
+
 func (l *Log) Write(key string, value string) error {
 	file, err := os.OpenFile(l.LogPath, os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		return fmt.Errorf("error opening file: %v", err)
 	}
-	marshalled, err := json.Marshal(map[string]string{
-		key: value,
-	})
+	defer file.Close()
+
+	entry := LogEntry{
+		Key:     key,
+		Value:   value,
+		Deleted: false,
+	}
+	marshalled, err := json.Marshal(entry)
 	if err != nil {
 		return fmt.Errorf("error marshalling json: %v", err)
 	}
@@ -32,6 +44,45 @@ func (l *Log) Write(key string, value string) error {
 		return fmt.Errorf("error writing newline: %v", err)
 	}
 
+	// Ensure data is written to disk
+	if err := file.Sync(); err != nil {
+		return fmt.Errorf("error syncing file: %v", err)
+	}
+
+	return nil
+}
+
+// Delete marks a key as deleted by writing a tombstone entry
+func (l *Log) Delete(key string) error {
+	file, err := os.OpenFile(l.LogPath, os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return fmt.Errorf("error opening file: %v", err)
+	}
+	defer file.Close()
+
+	entry := LogEntry{
+		Key:     key,
+		Value:   "",
+		Deleted: true,
+	}
+	marshalled, err := json.Marshal(entry)
+	if err != nil {
+		return fmt.Errorf("error marshalling json: %v", err)
+	}
+	_, err = file.Write(marshalled)
+	if err != nil {
+		return fmt.Errorf("error writing data: %v", err)
+	}
+	_, err = file.Write([]byte("\n"))
+	if err != nil {
+		return fmt.Errorf("error writing newline: %v", err)
+	}
+
+	// Ensure data is written to disk
+	if err := file.Sync(); err != nil {
+		return fmt.Errorf("error syncing file: %v", err)
+	}
+
 	return nil
 }
 
@@ -40,15 +91,52 @@ func (l *Log) Read(key string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("error opening file: %v", err)
 	}
+	defer file.Close()
+
 	scanner := bufio.NewScanner(file)
-	latest := ""
+	var latestValue string
+	var found bool
+	var isDeleted bool
+
 	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.HasPrefix(line, "{\""+key+"\":") {
-			latest = strings.TrimSuffix(strings.TrimPrefix(line, "{\""+key+"\":\""), "\"}")
+		line := scanner.Bytes()
+
+		// Try to unmarshal as new format first
+		var entry LogEntry
+		if err := json.Unmarshal(line, &entry); err == nil && entry.Key != "" {
+			// New format: {"key":"k","value":"v","deleted":false}
+			if entry.Key == key {
+				found = true
+				latestValue = entry.Value
+				isDeleted = entry.Deleted
+			}
+		} else {
+			// Try old format: {"key":"value"}
+			var oldEntry map[string]string
+			if err := json.Unmarshal(line, &oldEntry); err == nil {
+				if value, exists := oldEntry[key]; exists {
+					found = true
+					latestValue = value
+					isDeleted = false // Old format doesn't have deletes
+				}
+			}
+			// Ignore malformed lines
 		}
 	}
-	return latest, nil
+
+	if err := scanner.Err(); err != nil {
+		return "", fmt.Errorf("error scanning file: %v", err)
+	}
+
+	if !found {
+		return "", fmt.Errorf("key not found: %s", key)
+	}
+
+	if isDeleted {
+		return "", fmt.Errorf("key has been deleted: %s", key)
+	}
+
+	return latestValue, nil
 }
 
 func NewLog(logPath string) (*Log, error) {
@@ -80,18 +168,30 @@ func compact(l *Log) error {
 	defer readFile.Close()
 
 	scanner := bufio.NewScanner(readFile)
-	latestValues := make(map[string]string)
+	latestEntries := make(map[string]LogEntry)
 
-	// Read all entries and keep the latest value for each key
+	// Read all entries and keep the latest entry for each key
 	for scanner.Scan() {
 		line := scanner.Bytes()
-		var entry map[string]string
-		if err := json.Unmarshal(line, &entry); err != nil {
+
+		// Try to unmarshal as new format first
+		var entry LogEntry
+		if err := json.Unmarshal(line, &entry); err == nil && entry.Key != "" {
+			// New format: {"key":"k","value":"v","deleted":false}
+			latestEntries[entry.Key] = entry
+		} else {
+			// Try old format: {"key":"value"}
+			var oldEntry map[string]string
+			if err := json.Unmarshal(line, &oldEntry); err == nil {
+				for k, v := range oldEntry {
+					latestEntries[k] = LogEntry{
+						Key:     k,
+						Value:   v,
+						Deleted: false,
+					}
+				}
+			}
 			// Ignore malformed lines
-			continue
-		}
-		for k, v := range entry {
-			latestValues[k] = v
 		}
 	}
 
@@ -116,10 +216,14 @@ func compact(l *Log) error {
 	defer tmpFile.Close()
 
 	// Write the compacted data to the temporary file
-	for key, value := range latestValues {
-		marshalled, err := json.Marshal(map[string]string{
-			key: value,
-		})
+	// Skip entries that are marked as deleted (tombstones)
+	for _, entry := range latestEntries {
+		if entry.Deleted {
+			// Skip tombstone entries - they are removed during compaction
+			continue
+		}
+
+		marshalled, err := json.Marshal(entry)
 		if err != nil {
 			return fmt.Errorf("error marshalling json: %v", err)
 		}
