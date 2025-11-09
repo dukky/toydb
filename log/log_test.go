@@ -181,63 +181,43 @@ func TestNewLog(t *testing.T) {
 		t.Errorf("NewLog did not create the log file: %v", err)
 	}
 
-	// Test case 2: Compaction on existing file
-	// Write some initial data
+	// Test case 2: Opening existing file (small file - no auto-compaction)
+	// Write some initial data with duplicates
 	initialContent := `{"key1":"value1"}
 {"key2":"value2"}
-{"key1":"value3"}`
+{"key1":"value3"}
+`
 	if err := os.WriteFile(logPath, []byte(initialContent), 0644); err != nil {
-		t.Fatalf("Failed to write initial content for compaction test: %v", err)
+		t.Fatalf("Failed to write initial content: %v", err)
 	}
 
-	// Re-initialize Log to trigger compaction
-	logDB2, err := NewLog(logPath) // NewLog now returns an error
+	// Re-initialize Log - should NOT auto-compact because file is small
+	logDB2, err := NewLog(logPath)
 	if err != nil {
-		t.Fatalf("NewLog returned an error for an existing file requiring compaction: %v", err)
+		t.Fatalf("NewLog returned an error for an existing file: %v", err)
 	}
 	if logDB2 == nil {
-		t.Fatal("NewLog returned nil for an existing file requiring compaction")
+		t.Fatal("NewLog returned nil for an existing file")
 	}
 
-	// Read content to verify compaction
+	// File should still have 3 lines (no auto-compaction)
 	content, err := readFileContent(t, logPath)
 	if err != nil {
-		t.Fatalf("Failed to read compacted file after NewLog: %v", err)
+		t.Fatalf("Failed to read file after NewLog: %v", err)
 	}
 
-	expectedEntries := map[string]string{
-		"key1": "value3",
-		"key2": "value2",
-	}
-	lines := strings.Split(content, "\n")
-	if len(lines) > 0 && lines[len(lines)-1] == "" {
-		lines = lines[:len(lines)-1]
+	lines := strings.Split(strings.TrimSpace(content), "\n")
+	if len(lines) != 3 {
+		t.Errorf("Expected 3 entries (no auto-compaction for small files), got %d", len(lines))
 	}
 
-	if len(lines) != len(expectedEntries) {
-		t.Fatalf("Expected %d entries after NewLog compaction, but got %d. Content:\n%s", len(expectedEntries), len(lines), content)
+	// But reads should still work correctly (latest value wins)
+	value, err := logDB2.Read("key1")
+	if err != nil {
+		t.Fatalf("Failed to read key1: %v", err)
 	}
-
-	for _, line := range lines {
-		// Try new format first
-		var newEntry LogEntry
-		if err := json.Unmarshal([]byte(line), &newEntry); err == nil && newEntry.Key != "" {
-			if expectedV, ok := expectedEntries[newEntry.Key]; !ok || newEntry.Value != expectedV {
-				t.Errorf("Unexpected entry in compacted file after NewLog: %s:%s. Expected %s:%s", newEntry.Key, newEntry.Value, newEntry.Key, expectedV)
-			}
-		} else {
-			// Fall back to old format
-			var entry map[string]string
-			if err := json.Unmarshal([]byte(line), &entry); err != nil {
-				t.Errorf("Failed to unmarshal line '%s' from compacted file after NewLog: %v", line, err)
-				continue
-			}
-			for k, v := range entry {
-				if expectedV, ok := expectedEntries[k]; !ok || v != expectedV {
-					t.Errorf("Unexpected entry in compacted file after NewLog: %s:%s. Expected %s:%s", k, v, k, expectedV)
-				}
-			}
-		}
+	if value != "value3" {
+		t.Errorf("Expected value3 (latest), got %s", value)
 	}
 }
 
@@ -471,5 +451,173 @@ func TestDeleteAndRewrite(t *testing.T) {
 	}
 	if value != "value2" {
 		t.Errorf("Expected value2 after compaction, got %s", value)
+	}
+}
+
+// Test that small files don't trigger automatic compaction
+func TestNoAutoCompactionForSmallFiles(t *testing.T) {
+	tmpDir := t.TempDir()
+	logPath := filepath.Join(tmpDir, "test.log")
+
+	// Create a small log file with some duplicates
+	initialContent := `{"key":"key1","value":"value1","deleted":false}
+{"key":"key2","value":"value2","deleted":false}
+{"key":"key1","value":"value3","deleted":false}
+`
+	if err := os.WriteFile(logPath, []byte(initialContent), 0644); err != nil {
+		t.Fatalf("Failed to write test file: %v", err)
+	}
+
+	// Get initial file size
+	initialInfo, _ := os.Stat(logPath)
+	initialSize := initialInfo.Size()
+
+	// NewLog should NOT compact because file is small
+	logDB, err := NewLog(logPath)
+	if err != nil {
+		t.Fatalf("Failed to create log: %v", err)
+	}
+
+	// Check that file still has duplicates (not compacted)
+	content, err := readFileContent(t, logPath)
+	if err != nil {
+		t.Fatalf("Failed to read file: %v", err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(content), "\n")
+	if len(lines) != 3 {
+		t.Errorf("Expected 3 lines (no compaction), got %d. File should still have duplicates.", len(lines))
+	}
+
+	// Verify file size didn't change significantly (no compaction happened)
+	currentInfo, _ := os.Stat(logPath)
+	if currentInfo.Size() < initialSize-10 {
+		t.Error("File size decreased significantly, suggesting compaction occurred when it shouldn't")
+	}
+
+	// But reading should still work correctly (latest value wins)
+	value, err := logDB.Read("key1")
+	if err != nil {
+		t.Fatalf("Failed to read key1: %v", err)
+	}
+	if value != "value3" {
+		t.Errorf("Expected value3 (latest), got %s", value)
+	}
+}
+
+// Test that large files trigger automatic compaction
+func TestAutoCompactionForLargeFiles(t *testing.T) {
+	tmpDir := t.TempDir()
+	logPath := filepath.Join(tmpDir, "test.log")
+
+	// Create a large log file that exceeds the compaction threshold
+	file, err := os.Create(logPath)
+	if err != nil {
+		t.Fatalf("Failed to create test file: %v", err)
+	}
+
+	// Write enough data to exceed CompactionThreshold (1MB)
+	// Each entry is about 60 bytes, so write ~21,000 entries to be safe
+	for i := 0; i < 21000; i++ {
+		entry := LogEntry{
+			Key:     fmt.Sprintf("key%d", i%100), // Reuse keys to create duplicates
+			Value:   fmt.Sprintf("value%d", i),
+			Deleted: false,
+		}
+		marshalled, _ := json.Marshal(entry)
+		file.Write(marshalled)
+		file.Write([]byte("\n"))
+	}
+	file.Close()
+
+	// Get initial file size
+	initialInfo, _ := os.Stat(logPath)
+	initialSize := initialInfo.Size()
+
+	// Verify file is large enough to trigger compaction
+	if initialSize < CompactionThreshold {
+		t.Fatalf("Test file is too small (%d bytes), need at least %d bytes", initialSize, CompactionThreshold)
+	}
+
+	// NewLog SHOULD compact because file exceeds threshold
+	_, err = NewLog(logPath)
+	if err != nil {
+		t.Fatalf("Failed to create log: %v", err)
+	}
+
+	// Check that file was compacted (size should be much smaller)
+	compactedInfo, _ := os.Stat(logPath)
+	compactedSize := compactedInfo.Size()
+
+	if compactedSize >= initialSize {
+		t.Errorf("File was not compacted. Initial: %d bytes, After: %d bytes", initialSize, compactedSize)
+	}
+
+	// Should have only ~100 unique keys after compaction
+	content, err := readFileContent(t, logPath)
+	if err != nil {
+		t.Fatalf("Failed to read compacted file: %v", err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(content), "\n")
+	if len(lines) > 110 {
+		t.Errorf("Expected ~100 entries after compaction, got %d", len(lines))
+	}
+}
+
+// Test manual Compact() method
+func TestManualCompact(t *testing.T) {
+	tmpDir := t.TempDir()
+	logPath := filepath.Join(tmpDir, "test.log")
+
+	// Create a new log
+	logDB, err := NewLog(logPath)
+	if err != nil {
+		t.Fatalf("Failed to create log: %v", err)
+	}
+
+	// Write some entries with duplicates
+	if err := logDB.Write("key1", "value1"); err != nil {
+		t.Fatalf("Failed to write: %v", err)
+	}
+	if err := logDB.Write("key2", "value2"); err != nil {
+		t.Fatalf("Failed to write: %v", err)
+	}
+	if err := logDB.Write("key1", "value3"); err != nil {
+		t.Fatalf("Failed to write: %v", err)
+	}
+
+	// File should have 3 entries before compaction
+	content, err := readFileContent(t, logPath)
+	if err != nil {
+		t.Fatalf("Failed to read file: %v", err)
+	}
+	linesBefore := strings.Split(strings.TrimSpace(content), "\n")
+	if len(linesBefore) != 3 {
+		t.Errorf("Expected 3 entries before compaction, got %d", len(linesBefore))
+	}
+
+	// Manually compact
+	if err := logDB.Compact(); err != nil {
+		t.Fatalf("Failed to compact: %v", err)
+	}
+
+	// File should have 2 entries after compaction (duplicates removed)
+	content, err = readFileContent(t, logPath)
+	if err != nil {
+		t.Fatalf("Failed to read file after compaction: %v", err)
+	}
+	linesAfter := strings.Split(strings.TrimSpace(content), "\n")
+	if len(linesAfter) != 2 {
+		t.Errorf("Expected 2 entries after compaction, got %d", len(linesAfter))
+	}
+
+	// Verify data is still correct
+	value, err := logDB.Read("key1")
+	if err != nil {
+		t.Fatalf("Failed to read key1: %v", err)
+	}
+	if value != "value3" {
+		t.Errorf("Expected value3, got %s", value)
 	}
 }

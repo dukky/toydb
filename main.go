@@ -13,7 +13,7 @@ import (
 func main() {
 	dbFile := flag.String("file", "test.bin", "The path to the database file.")
 	dbType := flag.String("type", "log", "The type of database to use (log or hash).")
-	op := flag.String("op", "write", "The operation to perform (read, write, or delete).")
+	op := flag.String("op", "write", "The operation to perform (read, write, delete, or compact).")
 	key := flag.String("key", "", "The key for the operation.")
 	value := flag.String("value", "", "The value for the write operation.")
 
@@ -62,6 +62,20 @@ func main() {
 			log.Fatalf("Error deleting from database: %v", err)
 		}
 		fmt.Println("Delete successful.")
+	case "compact":
+		// Compact is only supported for log databases
+		if *dbType != "log" {
+			log.Fatalf("Compact operation is only supported for log databases.")
+		}
+		logDB, ok := d.(*logdb.Log)
+		if !ok {
+			log.Fatal("Failed to get log database instance.")
+		}
+		err := logDB.Compact()
+		if err != nil {
+			log.Fatalf("Error compacting database: %v", err)
+		}
+		fmt.Println("Compact successful.")
 	default:
 		log.Fatalf("Unknown operation: %s", *op)
 	}
