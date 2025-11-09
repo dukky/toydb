@@ -22,7 +22,7 @@ type Log struct {
 type LogEntry struct {
 	Key     string `json:"key"`
 	Value   string `json:"value"`
-	Deleted bool   `json:"deleted"`
+	Deleted bool   `json:"deleted,omitempty"`
 }
 
 func (l *Log) Write(key string, value string) error {

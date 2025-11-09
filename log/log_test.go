@@ -517,8 +517,8 @@ func TestAutoCompactionForLargeFiles(t *testing.T) {
 	}
 
 	// Write enough data to exceed CompactionThreshold (1MB)
-	// Each entry is about 60 bytes, so write ~21,000 entries to be safe
-	for i := 0; i < 21000; i++ {
+	// Each entry is about 36 bytes with omitempty optimization, so write ~30,000 entries to be safe
+	for i := 0; i < 30000; i++ {
 		entry := LogEntry{
 			Key:     fmt.Sprintf("key%d", i%100), // Reuse keys to create duplicates
 			Value:   fmt.Sprintf("value%d", i),
