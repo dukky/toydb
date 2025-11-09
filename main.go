@@ -23,7 +23,11 @@ func main() {
 
 	switch *dbType {
 	case "log":
-		d = logdb.NewLog(*dbFile)
+		var err error
+		d, err = logdb.NewLog(*dbFile)
+		if err != nil {
+			log.Fatalf("Error initializing log database: %v", err)
+		}
 	case "hash":
 		d = hashkv.NewHashKV(*dbFile)
 	default:
