@@ -28,6 +28,14 @@ func main() {
 		if err != nil {
 			log.Fatalf("Error initializing log database: %v", err)
 		}
+		// Ensure the database lock is released when we're done
+		defer func() {
+			if logDB, ok := d.(*logdb.Log); ok {
+				if err := logDB.Close(); err != nil {
+					log.Printf("Warning: error closing database: %v", err)
+				}
+			}
+		}()
 	case "hash":
 		d = hashkv.NewHashKV(*dbFile)
 	default:
