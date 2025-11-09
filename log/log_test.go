@@ -7,7 +7,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 // Helper function to create a temporary log file with given content
@@ -180,6 +182,8 @@ func TestNewLog(t *testing.T) {
 	if _, err := os.Stat(logPath); os.IsNotExist(err) {
 		t.Errorf("NewLog did not create the log file: %v", err)
 	}
+	// Close before modifying the file
+	logDB1.Close()
 
 	// Test case 2: Opening existing file (small file - no auto-compaction)
 	// Write some initial data with duplicates
@@ -196,6 +200,7 @@ func TestNewLog(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewLog returned an error for an existing file: %v", err)
 	}
+	defer logDB2.Close()
 	if logDB2 == nil {
 		t.Fatal("NewLog returned nil for an existing file")
 	}
@@ -231,6 +236,7 @@ func TestDelete(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create new log: %v", err)
 	}
+	defer logDB.Close()
 
 	// Write a key-value pair
 	if err := logDB.Write("key1", "value1"); err != nil {
@@ -332,7 +338,11 @@ func TestBackwardCompatibility(t *testing.T) {
 		t.Fatalf("Failed to write test file: %v", err)
 	}
 
-	logDB := &Log{LogPath: logPath}
+	logDB, err := NewLog(logPath)
+	if err != nil {
+		t.Fatalf("Failed to open log: %v", err)
+	}
+	defer logDB.Close()
 
 	// Should be able to read old format
 	value, err := logDB.Read("key1")
@@ -390,6 +400,7 @@ func TestReadNonExistentKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create new log: %v", err)
 	}
+	defer logDB.Close()
 
 	// Write some data
 	if err := logDB.Write("key1", "value1"); err != nil {
@@ -415,6 +426,7 @@ func TestDeleteAndRewrite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create new log: %v", err)
 	}
+	defer logDB.Close()
 
 	// Write a key
 	if err := logDB.Write("key1", "value1"); err != nil {
@@ -477,6 +489,7 @@ func TestNoAutoCompactionForSmallFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create log: %v", err)
 	}
+	defer logDB.Close()
 
 	// Check that file still has duplicates (not compacted)
 	content, err := readFileContent(t, logPath)
@@ -540,10 +553,11 @@ func TestAutoCompactionForLargeFiles(t *testing.T) {
 	}
 
 	// NewLog SHOULD compact because file exceeds threshold
-	_, err = NewLog(logPath)
+	logDB, err := NewLog(logPath)
 	if err != nil {
 		t.Fatalf("Failed to create log: %v", err)
 	}
+	defer logDB.Close()
 
 	// Check that file was compacted (size should be much smaller)
 	compactedInfo, _ := os.Stat(logPath)
@@ -575,6 +589,7 @@ func TestManualCompact(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create log: %v", err)
 	}
+	defer logDB.Close()
 
 	// Write some entries with duplicates
 	if err := logDB.Write("key1", "value1"); err != nil {
@@ -619,5 +634,211 @@ func TestManualCompact(t *testing.T) {
 	}
 	if value != "value3" {
 		t.Errorf("Expected value3, got %s", value)
+	}
+}
+
+// Test concurrent reads and writes from multiple goroutines
+func TestConcurrentReadWrite(t *testing.T) {
+	tmpDir := t.TempDir()
+	logPath := filepath.Join(tmpDir, "test.log")
+
+	logDB, err := NewLog(logPath)
+	if err != nil {
+		t.Fatalf("Failed to create log: %v", err)
+	}
+	defer logDB.Close()
+
+	// Number of concurrent goroutines
+	numGoroutines := 10
+	numOperations := 100
+
+	var wg sync.WaitGroup
+	errors := make(chan error, numGoroutines*numOperations)
+
+	// Launch multiple writers
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < numOperations; j++ {
+				key := fmt.Sprintf("key%d", id)
+				value := fmt.Sprintf("value%d-%d", id, j)
+				if err := logDB.Write(key, value); err != nil {
+					errors <- fmt.Errorf("goroutine %d: write error: %v", id, err)
+				}
+			}
+		}(i)
+	}
+
+	// Launch multiple readers
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < numOperations; j++ {
+				key := fmt.Sprintf("key%d", id%numGoroutines)
+				// Read may fail if the key doesn't exist yet, which is fine
+				_, _ = logDB.Read(key)
+				time.Sleep(time.Microsecond)
+			}
+		}(i)
+	}
+
+	// Wait for all goroutines to complete
+	wg.Wait()
+	close(errors)
+
+	// Check if there were any errors
+	for err := range errors {
+		t.Error(err)
+	}
+
+	// Verify that we can read all the final values
+	for i := 0; i < numGoroutines; i++ {
+		key := fmt.Sprintf("key%d", i)
+		value, err := logDB.Read(key)
+		if err != nil {
+			t.Errorf("Failed to read %s: %v", key, err)
+		}
+		// Value should be the last one written (value-i-99)
+		expectedValue := fmt.Sprintf("value%d-%d", i, numOperations-1)
+		if value != expectedValue {
+			t.Errorf("Expected %s for key %s, got %s", expectedValue, key, value)
+		}
+	}
+}
+
+// Test that a second process cannot open a locked database
+func TestFileLockPreventsMultipleProcesses(t *testing.T) {
+	tmpDir := t.TempDir()
+	logPath := filepath.Join(tmpDir, "test.log")
+
+	// First process opens the database
+	logDB1, err := NewLog(logPath)
+	if err != nil {
+		t.Fatalf("Failed to create first log instance: %v", err)
+	}
+	defer logDB1.Close()
+
+	// Second process tries to open the same database - should fail
+	logDB2, err := NewLog(logPath)
+	if err == nil {
+		logDB2.Close()
+		t.Fatal("Expected error when opening locked database, got nil")
+	}
+	if !strings.Contains(err.Error(), "already in use") {
+		t.Errorf("Expected error message to contain 'already in use', got: %v", err)
+	}
+}
+
+// Test that Close() releases the lock properly
+func TestCloseReleasesLock(t *testing.T) {
+	tmpDir := t.TempDir()
+	logPath := filepath.Join(tmpDir, "test.log")
+
+	// First process opens the database
+	logDB1, err := NewLog(logPath)
+	if err != nil {
+		t.Fatalf("Failed to create first log instance: %v", err)
+	}
+
+	// Close the database
+	if err := logDB1.Close(); err != nil {
+		t.Fatalf("Failed to close database: %v", err)
+	}
+
+	// Second process should now be able to open the database
+	logDB2, err := NewLog(logPath)
+	if err != nil {
+		t.Fatalf("Failed to open database after first instance closed: %v", err)
+	}
+	defer logDB2.Close()
+
+	// Verify lock file was removed
+	lockPath := logPath + ".lock"
+	if _, err := os.Stat(lockPath); !os.IsNotExist(err) {
+		// Lock file exists - this is actually okay, it will be created by logDB2
+		// The important thing is that logDB2 could acquire the lock
+	}
+}
+
+// Test concurrent compaction is safe
+func TestConcurrentCompaction(t *testing.T) {
+	tmpDir := t.TempDir()
+	logPath := filepath.Join(tmpDir, "test.log")
+
+	logDB, err := NewLog(logPath)
+	if err != nil {
+		t.Fatalf("Failed to create log: %v", err)
+	}
+	defer logDB.Close()
+
+	// Write some initial data
+	for i := 0; i < 100; i++ {
+		if err := logDB.Write(fmt.Sprintf("key%d", i), fmt.Sprintf("value%d", i)); err != nil {
+			t.Fatalf("Failed to write initial data: %v", err)
+		}
+	}
+
+	var wg sync.WaitGroup
+	errors := make(chan error, 10)
+
+	// Launch concurrent operations
+	// 1. Compaction
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := logDB.Compact(); err != nil {
+			errors <- fmt.Errorf("compaction error: %v", err)
+		}
+	}()
+
+	// 2. Concurrent reads
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < 50; j++ {
+				key := fmt.Sprintf("key%d", j)
+				_, _ = logDB.Read(key)
+				time.Sleep(time.Microsecond)
+			}
+		}(i)
+	}
+
+	// 3. Concurrent writes
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < 20; j++ {
+				key := fmt.Sprintf("newkey%d", id*20+j)
+				if err := logDB.Write(key, fmt.Sprintf("newvalue%d", j)); err != nil {
+					errors <- fmt.Errorf("write error: %v", err)
+				}
+				time.Sleep(time.Microsecond)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	close(errors)
+
+	// Check for errors
+	for err := range errors {
+		t.Error(err)
+	}
+
+	// Verify data integrity - all original keys should still be readable
+	for i := 0; i < 100; i++ {
+		key := fmt.Sprintf("key%d", i)
+		value, err := logDB.Read(key)
+		if err != nil {
+			t.Errorf("Failed to read %s after concurrent operations: %v", key, err)
+		}
+		expectedValue := fmt.Sprintf("value%d", i)
+		if value != expectedValue {
+			t.Errorf("Data corruption: expected %s for key %s, got %s", expectedValue, key, value)
+		}
 	}
 }

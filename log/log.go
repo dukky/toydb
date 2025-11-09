@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
+	"syscall"
 )
 
 // CompactionThreshold is the minimum file size (in bytes) that triggers
@@ -15,7 +17,9 @@ import (
 const CompactionThreshold = 1024 * 1024
 
 type Log struct {
-	LogPath string
+	LogPath  string
+	mu       sync.RWMutex // Protects concurrent access within the same process
+	lockFile *os.File     // File-based lock to prevent multi-process access
 }
 
 // LogEntry represents a single entry in the log file
@@ -26,6 +30,9 @@ type LogEntry struct {
 }
 
 func (l *Log) Write(key string, value string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
 	file, err := os.OpenFile(l.LogPath, os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		return fmt.Errorf("error opening file: %v", err)
@@ -60,6 +67,9 @@ func (l *Log) Write(key string, value string) error {
 
 // Delete marks a key as deleted by writing a tombstone entry
 func (l *Log) Delete(key string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
 	file, err := os.OpenFile(l.LogPath, os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		return fmt.Errorf("error opening file: %v", err)
@@ -93,6 +103,9 @@ func (l *Log) Delete(key string) error {
 }
 
 func (l *Log) Read(key string) (string, error) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
 	file, err := os.Open(l.LogPath)
 	if err != nil {
 		return "", fmt.Errorf("error opening file: %v", err)
@@ -149,10 +162,29 @@ func NewLog(logPath string) (*Log, error) {
 	db := &Log{
 		LogPath: logPath,
 	}
+
+	// Acquire file-based lock to prevent multi-process access
+	lockPath := logPath + ".lock"
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("error creating lock file: %w", err)
+	}
+
+	// Try to acquire exclusive lock (LOCK_EX | LOCK_NB = non-blocking exclusive lock)
+	err = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+	if err != nil {
+		lockFile.Close()
+		return nil, fmt.Errorf("database is already in use by another process: %w", err)
+	}
+
+	db.lockFile = lockFile
+
 	fileInfo, err := os.Stat(logPath)
 	if os.IsNotExist(err) {
 		file, err := os.Create(logPath)
 		if err != nil {
+			// Release lock before returning error
+			db.Close()
 			return nil, fmt.Errorf("error creating log file: %w", err)
 		}
 		file.Close() // Close immediately as we don't need the handle here
@@ -160,17 +192,55 @@ func NewLog(logPath string) (*Log, error) {
 	}
 	// If file exists and exceeds threshold, compact it
 	if fileInfo.Size() >= CompactionThreshold {
-		if err = compact(db); err != nil {
+		// Protect auto-compaction with mutex
+		db.mu.Lock()
+		err = compact(db)
+		db.mu.Unlock()
+		if err != nil {
+			// Release lock before returning error
+			db.Close()
 			return nil, fmt.Errorf("error during log compaction: %w", err)
 		}
 	}
 	return db, nil
 }
 
+// Close releases the file lock and closes the database.
+// This must be called when done using the database to allow other processes to access it.
+func (l *Log) Close() error {
+	if l.lockFile == nil {
+		return nil
+	}
+
+	// Release the file lock
+	if err := syscall.Flock(int(l.lockFile.Fd()), syscall.LOCK_UN); err != nil {
+		return fmt.Errorf("error releasing lock: %w", err)
+	}
+
+	// Close the lock file
+	if err := l.lockFile.Close(); err != nil {
+		return fmt.Errorf("error closing lock file: %w", err)
+	}
+
+	// Remove the lock file
+	lockPath := l.LogPath + ".lock"
+	if err := os.Remove(lockPath); err != nil {
+		// Don't return error if file doesn't exist
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("error removing lock file: %w", err)
+		}
+	}
+
+	l.lockFile = nil
+	return nil
+}
+
 // Compact manually triggers compaction of the log file, removing duplicate
 // entries and tombstones regardless of file size. This can be used to reclaim
 // space or optimize read performance on demand.
 func (l *Log) Compact() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	return compact(l)
 }
 
