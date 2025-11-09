@@ -8,6 +8,12 @@ import (
 	"strings"
 )
 
+// CompactionThreshold is the minimum file size (in bytes) that triggers
+// automatic compaction when opening a log database. Files smaller than
+// this threshold will not be compacted automatically to improve performance.
+// Default: 1MB (1024 * 1024 bytes)
+const CompactionThreshold = 1024 * 1024
+
 type Log struct {
 	LogPath string
 }
@@ -143,7 +149,7 @@ func NewLog(logPath string) (*Log, error) {
 	db := &Log{
 		LogPath: logPath,
 	}
-	_, err := os.Stat(logPath)
+	fileInfo, err := os.Stat(logPath)
 	if os.IsNotExist(err) {
 		file, err := os.Create(logPath)
 		if err != nil {
@@ -152,11 +158,20 @@ func NewLog(logPath string) (*Log, error) {
 		file.Close() // Close immediately as we don't need the handle here
 		return db, nil
 	}
-	// If file exists, attempt to compact it
-	if err = compact(db); err != nil {
-		return nil, fmt.Errorf("error during log compaction: %w", err)
+	// If file exists and exceeds threshold, compact it
+	if fileInfo.Size() >= CompactionThreshold {
+		if err = compact(db); err != nil {
+			return nil, fmt.Errorf("error during log compaction: %w", err)
+		}
 	}
 	return db, nil
+}
+
+// Compact manually triggers compaction of the log file, removing duplicate
+// entries and tombstones regardless of file size. This can be used to reclaim
+// space or optimize read performance on demand.
+func (l *Log) Compact() error {
+	return compact(l)
 }
 
 func compact(l *Log) error {
