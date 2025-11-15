@@ -8,12 +8,13 @@ import (
 	"github.com/dukky/toydb/db"
 	"github.com/dukky/toydb/hashkv"
 	logdb "github.com/dukky/toydb/log"
+	"github.com/dukky/toydb/sstable"
 )
 
 func main() {
-	dbFile := flag.String("file", "test.bin", "The path to the database file.")
-	dbType := flag.String("type", "log", "The type of database to use (log or hash).")
-	op := flag.String("op", "write", "The operation to perform (read, write, delete, or compact).")
+	dbFile := flag.String("file", "test.bin", "The path to the database file or directory.")
+	dbType := flag.String("type", "log", "The type of database to use (log, hash, or sstable).")
+	op := flag.String("op", "write", "The operation to perform (read, write, delete, compact, or flush).")
 	key := flag.String("key", "", "The key for the operation.")
 	value := flag.String("value", "", "The value for the write operation.")
 
@@ -30,6 +31,20 @@ func main() {
 		}
 	case "hash":
 		d = hashkv.NewHashKV(*dbFile)
+	case "sstable":
+		var err error
+		d, err = sstable.NewSSTableDB(*dbFile)
+		if err != nil {
+			log.Fatalf("Error initializing SSTable database: %v", err)
+		}
+		// Close SSTable DB when done to flush memtable
+		defer func() {
+			if sstDB, ok := d.(*sstable.SSTableDB); ok {
+				if err := sstDB.Close(); err != nil {
+					log.Printf("Error closing SSTable database: %v", err)
+				}
+			}
+		}()
 	default:
 		log.Fatalf("Unknown database type: %s", *dbType)
 	}
@@ -63,19 +78,45 @@ func main() {
 		}
 		fmt.Println("Delete successful.")
 	case "compact":
-		// Compact is only supported for log databases
-		if *dbType != "log" {
-			log.Fatalf("Compact operation is only supported for log databases.")
+		// Compact is supported for log and sstable databases
+		switch *dbType {
+		case "log":
+			logDB, ok := d.(*logdb.Log)
+			if !ok {
+				log.Fatal("Failed to get log database instance.")
+			}
+			err := logDB.Compact()
+			if err != nil {
+				log.Fatalf("Error compacting database: %v", err)
+			}
+			fmt.Println("Compact successful.")
+		case "sstable":
+			sstDB, ok := d.(*sstable.SSTableDB)
+			if !ok {
+				log.Fatal("Failed to get SSTable database instance.")
+			}
+			err := sstDB.Compact()
+			if err != nil {
+				log.Fatalf("Error compacting database: %v", err)
+			}
+			fmt.Println("Compact successful.")
+		default:
+			log.Fatalf("Compact operation is not supported for %s databases.", *dbType)
 		}
-		logDB, ok := d.(*logdb.Log)
+	case "flush":
+		// Flush is only supported for SSTable databases
+		if *dbType != "sstable" {
+			log.Fatalf("Flush operation is only supported for sstable databases.")
+		}
+		sstDB, ok := d.(*sstable.SSTableDB)
 		if !ok {
-			log.Fatal("Failed to get log database instance.")
+			log.Fatal("Failed to get SSTable database instance.")
 		}
-		err := logDB.Compact()
+		err := sstDB.Flush()
 		if err != nil {
-			log.Fatalf("Error compacting database: %v", err)
+			log.Fatalf("Error flushing database: %v", err)
 		}
-		fmt.Println("Compact successful.")
+		fmt.Println("Flush successful.")
 	default:
 		log.Fatalf("Unknown operation: %s", *op)
 	}
