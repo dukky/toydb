@@ -75,6 +75,18 @@ func NewLog(logPath string) *Log {
 }
 
 func compact(l *Log) error {
+	// TODO: This compact function has a bug!
+	// Currently it deduplicates entire lines (seen[scanner.Text()]), but it should
+	// deduplicate by KEY, keeping only the latest VALUE for each key.
+	//
+	// The issue: If you write key="foo" value="bar", then write key="foo" value="baz",
+	// both lines are kept because they're different strings. But compact should only
+	// keep the latest entry: key="foo" value="baz".
+	//
+	// Hint: You need to parse the JSON on each line to extract the key-value pairs,
+	// and store them in a map[string]string instead of map[string]struct{}.
+	// See TestCompactDuplicateKeys in log_test.go for a failing test that demonstrates this bug.
+
 	file, err := os.Open(l.LogPath)
 	if err != nil {
 		return fmt.Errorf("error opening file: %v", err)
