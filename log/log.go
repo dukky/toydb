@@ -2,17 +2,19 @@ package logdb
 
 import (
 	"bufio"
-	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"os"
-	"strings"
 )
 
 type Log struct {
 	LogPath string
+}
+
+type Entry struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
 }
 
 func (l *Log) Write(key string, value string) error {
@@ -20,8 +22,9 @@ func (l *Log) Write(key string, value string) error {
 	if err != nil {
 		return fmt.Errorf("error opening file: %v", err)
 	}
-	marshalled, err := json.Marshal(map[string]string{
-		key: value,
+	marshalled, err := json.Marshal(Entry{
+		Key:   key,
+		Value: value,
 	})
 	if err != nil {
 		return fmt.Errorf("error marshalling json: %v", err)
@@ -43,12 +46,16 @@ func (l *Log) Read(key string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("error opening file: %v", err)
 	}
+	defer file.Close()
 	scanner := bufio.NewScanner(file)
 	latest := ""
 	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.HasPrefix(line, "{\""+key+"\":") {
-			latest = strings.TrimSuffix(strings.TrimPrefix(line, "{\""+key+"\":\""), "\"}")
+		var entry Entry
+		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
+			return "", fmt.Errorf("error unmarshalling json: %v", err)
+		}
+		if entry.Key == key {
+			latest = entry.Value
 		}
 	}
 	return latest, nil
@@ -92,9 +99,13 @@ func compact(l *Log) error {
 		return fmt.Errorf("error opening file: %v", err)
 	}
 	scanner := bufio.NewScanner(file)
-	seen := make(map[string]struct{})
+	seen := make(map[string]string)
 	for scanner.Scan() {
-		seen[scanner.Text()] = struct{}{}
+		var entry Entry
+		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
+			return fmt.Errorf("error unmarshalling json: %v", err)
+		}
+		seen[entry.Key] = entry.Value
 	}
 	file.Close()
 	file, err = os.Create(l.LogPath)
@@ -102,21 +113,18 @@ func compact(l *Log) error {
 		return err
 	}
 	fmt.Println(seen)
-	for k := range seen {
-		var data bytes.Buffer
-		encoder := json.NewEncoder(&data)
-		encoder.SetEscapeHTML(false)
-		err := encoder.Encode(k)
+	for k, v := range seen {
+		entry, err := json.Marshal(Entry{
+			Key:   k,
+			Value: v,
+		})
 		if err != nil {
-			return fmt.Errorf("error marshalling line: %v", err)
+			return fmt.Errorf("error marshalling json: %v", err)
 		}
-		_, err = io.Copy(file, &data)
+		entry = append(entry, '\n')
+		_, err = file.Write(entry)
 		if err != nil {
 			return fmt.Errorf("error writing data: %v", err)
-		}
-		_, err = file.Write([]byte("\n"))
-		if err != nil {
-			return fmt.Errorf("error writing newline: %v", err)
 		}
 	}
 	return nil
