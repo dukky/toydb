@@ -1,4 +1,4 @@
-package logdb
+package log
 
 import (
 	"bufio"

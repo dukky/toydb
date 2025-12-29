@@ -1,24 +1,19 @@
 package main
 
 import (
-	"fmt"
-	"log"
-
-	logdb "github.com/dukky/toydb/log"
+	"github.com/dukky/toydb/db"
+	"github.com/dukky/toydb/log"
 )
 
 func main() {
-	db := logdb.NewLog("test.bin")
+	var db db.DB = log.NewLog("test.log")
 
-	err := db.Write("Hello", "you")
-	if err != nil {
-		log.Fatal(err)
-	}
-	fmt.Println("Write succeded")
+	db.Write("Hello", "world")
+	db.Write("Goodbye", "world")
 
-	data, err := db.Read("Hello")
-	if err != nil {
-		log.Fatal(err)
-	}
-	fmt.Println("Read: ", data)
+	value, _ := db.Read("Hello")
+	println("Hello:", value)
+
+	value, _ = db.Read("Goodbye")
+	println("Goodbye:", value)
 }
