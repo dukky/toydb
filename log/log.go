@@ -22,6 +22,7 @@ func (l *Log) Write(key string, value string) error {
 	if err != nil {
 		return fmt.Errorf("error opening file: %v", err)
 	}
+	defer file.Close()
 	marshalled, err := json.Marshal(Entry{
 		Key:   key,
 		Value: value,
@@ -29,13 +30,11 @@ func (l *Log) Write(key string, value string) error {
 	if err != nil {
 		return fmt.Errorf("error marshalling json: %v", err)
 	}
+
+	marshalled = append(marshalled, '\n')
 	_, err = file.Write(marshalled)
 	if err != nil {
 		return fmt.Errorf("error writing data: %v", err)
-	}
-	_, err = file.Write([]byte("\n"))
-	if err != nil {
-		return fmt.Errorf("error writing newline: %v", err)
 	}
 
 	return nil
@@ -82,23 +81,12 @@ func NewLog(logPath string) *Log {
 }
 
 func compact(l *Log) error {
-	// TODO: This compact function has a bug!
-	// Currently it deduplicates entire lines (seen[scanner.Text()]), but it should
-	// deduplicate by KEY, keeping only the latest VALUE for each key.
-	//
-	// The issue: If you write key="foo" value="bar", then write key="foo" value="baz",
-	// both lines are kept because they're different strings. But compact should only
-	// keep the latest entry: key="foo" value="baz".
-	//
-	// Hint: You need to parse the JSON on each line to extract the key-value pairs,
-	// and store them in a map[string]string instead of map[string]struct{}.
-	// See TestCompactDuplicateKeys in log_test.go for a failing test that demonstrates this bug.
-
-	file, err := os.Open(l.LogPath)
+	readFile, err := os.Open(l.LogPath)
 	if err != nil {
 		return fmt.Errorf("error opening file: %v", err)
 	}
-	scanner := bufio.NewScanner(file)
+	defer readFile.Close()
+	scanner := bufio.NewScanner(readFile)
 	seen := make(map[string]string)
 	for scanner.Scan() {
 		var entry Entry
@@ -107,12 +95,11 @@ func compact(l *Log) error {
 		}
 		seen[entry.Key] = entry.Value
 	}
-	file.Close()
-	file, err = os.Create(l.LogPath)
+	writeFile, err := os.Create(l.LogPath)
 	if err != nil {
 		return err
 	}
-	fmt.Println(seen)
+	defer writeFile.Close()
 	for k, v := range seen {
 		entry, err := json.Marshal(Entry{
 			Key:   k,
@@ -122,7 +109,7 @@ func compact(l *Log) error {
 			return fmt.Errorf("error marshalling json: %v", err)
 		}
 		entry = append(entry, '\n')
-		_, err = file.Write(entry)
+		_, err = writeFile.Write(entry)
 		if err != nil {
 			return fmt.Errorf("error writing data: %v", err)
 		}
