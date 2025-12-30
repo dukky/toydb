@@ -95,11 +95,12 @@ func compact(l *Log) error {
 		}
 		seen[entry.Key] = entry.Value
 	}
-	writeFile, err := os.Create(l.LogPath)
+	tmpFile, err := os.Create(l.LogPath + ".tmp")
 	if err != nil {
 		return err
 	}
-	defer writeFile.Close()
+	defer os.Remove(tmpFile.Name())
+	defer tmpFile.Close()
 	for k, v := range seen {
 		entry, err := json.Marshal(Entry{
 			Key:   k,
@@ -109,10 +110,14 @@ func compact(l *Log) error {
 			return fmt.Errorf("error marshalling json: %v", err)
 		}
 		entry = append(entry, '\n')
-		_, err = writeFile.Write(entry)
+		_, err = tmpFile.Write(entry)
 		if err != nil {
 			return fmt.Errorf("error writing data: %v", err)
 		}
+	}
+	err = os.Rename(tmpFile.Name(), l.LogPath)
+	if err != nil {
+		return fmt.Errorf("error renaming file: %v", err)
 	}
 	return nil
 }
